@@ -1,91 +1,165 @@
-
-
 import fitz  # PyMuPDF
 from deep_translator import GoogleTranslator
+from transformers import MarianTokenizer, MarianMTModel
 import concurrent.futures
 import argparse
 import os
 import sys
 import base64
+import re
+from collections import Counter
 
-def translate_page_content(page_num, pdf_path, source_lang, target_lang):
+def translate_page_content(page_num, pdf_path, source_lang, target_lang, tokenizer, model):
     """
-    Translates text and embeds images for a single PDF page.
-
-    This function is designed to be run in a separate thread. It opens the PDF,
-    extracts both text and image elements, sorts them by vertical position,
-    translates the text, and formats everything into an HTML snippet.
-
-    Args:
-        page_num (int): The page number to process (0-indexed).
-        pdf_path (str): The absolute path to the PDF file.
-        source_lang (str): The source language code (e.g., 'en').
-        target_lang (str): The target language code (e.g., 'it').
-
-    Returns:
-        str: An HTML string containing the translated content and images of the page.
+    Handles text, links (internal & external), and images for a single PDF page.
+    This version identifies link text, protects it from translation, and recreates
+    the appropriate HTML links (<a>) in the final output, and attempts to preserve
+    basic text styling (size, bold, italic) for paragraphs.
     """
     try:
         doc = fitz.open(pdf_path)
         page = doc.load_page(page_num)
-        
-        page_items = []
-        translator = GoogleTranslator(source=source_lang, target=target_lang)
 
-        # 1. Extract text blocks
-        text_blocks = page.get_text("dict").get("blocks", [])
-        for block in text_blocks:
-            if block["type"] == 0:  # It's a text block
-                block_text = ""
+        # 1. Extract all content types: links, images, and text spans
+        links = page.get_links()
+        image_list = page.get_images(full=True)
+        blocks = page.get_text("dict").get("blocks", [])
+
+        # 2. Create a unified list of all content items with their bounding boxes
+        page_items = []
+        for block in blocks:
+            if block["type"] == 0: # Text block
                 for line in block.get("lines", []):
                     for span in line.get("spans", []):
-                        block_text += span.get("text", "") + " "
-                block_text = block_text.strip()
-                if block_text:
-                    page_items.append({"type": "text", "bbox": block["bbox"], "content": block_text})
-
-        # 2. Extract image references
-        image_list = page.get_images(full=True)
+                        if (span['bbox'][3] - span['bbox'][1]) > 5:
+                            # Store size and flags for styling
+                            page_items.append({"type": "text", "bbox": span["bbox"], "text": span["text"], "size": span["size"], "flags": span["flags"]})
+        
         for img_info in image_list:
-            xref = img_info[0]
             try:
-                bbox = page.get_image_bbox(img_info)
-                page_items.append({"type": "image", "bbox": bbox, "xref": xref})
-            except ValueError as e:
-                print(f"Info: Skipping image with xref {xref} on page {page_num + 1}. Reason: {e}", file=sys.stderr)
+                page_items.append({"type": "image", "bbox": page.get_image_bbox(img_info), "xref": img_info[0]})
+            except ValueError:
+                pass # Skip images that can't be placed
 
-        # 3. Sort all items by their vertical position
-        page_items.sort(key=lambda item: item["bbox"][1])
-
-        # 4. Process sorted items and generate HTML
-        translated_html_parts = []
+        # Add link information to text items
         for item in page_items:
             if item["type"] == "text":
-                original_text = item["content"]
-                original_text = original_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                try:
-                    translated_text = translator.translate(original_text)
-                    if translated_text:
-                        translated_html_parts.append(f"<p>{translated_text}</p>")
-                except Exception as e:
-                    print(f"Warning: Could not translate a block on page {page_num + 1}. Error: {e}", file=sys.stderr)
-                    translated_html_parts.append(f'<p><em>[Translation Failed]</em> {original_text}</p>')
-            
-            elif item["type"] == "image":
-                try:
-                    img = doc.extract_image(item["xref"])
-                    img_bytes = img["image"]
-                    img_ext = img["ext"]
-                    b64_img = base64.b64encode(img_bytes).decode('utf-8')
-                    translated_html_parts.append(f'<div style="text-align: center; margin: 20px 0;"><img src="data:image/{img_ext};base64,{b64_img}" style="max-width: 90%; height: auto; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);"></div>')
-                except Exception as e:
-                    print(f"Warning: Could not extract image with xref {item['xref']} on page {page_num + 1}. Error: {e}", file=sys.stderr)
+                for link in links:
+                    if fitz.Rect(item["bbox"]).intersects(link["from"]):
+                        item["type"] = "link"
+                        if link["kind"] == fitz.LINK_URI:
+                            item["dest"] = link["uri"]
+                        elif link["kind"] == fitz.LINK_GOTO:
+                            item["dest"] = link["page"]
+                        break
 
+        page_items.sort(key=lambda item: (item["bbox"][1], item["bbox"][0]))
+
+        if not page_items:
+            doc.close()
+            return ""
+
+        # 3. Group items into paragraphs
+        grouped_content = []
+        current_paragraph = []
+        for i, item in enumerate(page_items):
+            if item["type"] == "image":
+                if current_paragraph:
+                    grouped_content.append({"type": "paragraph", "items": current_paragraph})
+                    current_paragraph = []
+                grouped_content.append(item)
+                continue
+
+            if not current_paragraph:
+                current_paragraph.append(item)
+            else:
+                prev_item = current_paragraph[-1]
+                vertical_gap = item["bbox"][1] - prev_item["bbox"][3]
+                line_height = prev_item["bbox"][3] - prev_item["bbox"][1]
+                
+                # Check for indentation
+                indentation_threshold = 15 # pixels
+                is_indented = (item["bbox"][0] - prev_item["bbox"][0]) > indentation_threshold
+
+                if vertical_gap < line_height * 0.1 and not is_indented: # Combine if very small gap AND no significant indentation
+                    current_paragraph.append(item)
+                else: # Start new paragraph if larger gap OR significant indentation
+                    grouped_content.append({"type": "paragraph", "items": current_paragraph})
+                    current_paragraph = [item]
+        
+        if current_paragraph:
+            grouped_content.append({"type": "paragraph", "items": current_paragraph})
+
+        # 4. Translate and generate HTML
+        final_html_parts = []
+        for group in grouped_content:
+            if group["type"] == "image":
+                try:
+                    img = doc.extract_image(group["xref"])
+                    b64_img = base64.b64encode(img["image"]).decode('utf-8')
+                    final_html_parts.append(f'<div style="text-align: center; margin: 20px 0;"><img src="data:image/{img["ext"]};base64,{b64_img}" style="max-width: 90%; height: auto; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);"></div>')
+                except Exception as e:
+                    print(f"Warning: Could not extract image {group['xref']} on page {page_num + 1}. Error: {e}", file=sys.stderr)
+            
+            elif group["type"] == "paragraph":
+                text_to_translate = ""
+                
+                # Determine dominant style for the paragraph
+                sizes = [item['size'] for item in group['items'] if item['type'] == 'text']
+                flags = [item['flags'] for item in group['items'] if item['type'] == 'text']
+
+                dominant_size = Counter(sizes).most_common(1)[0][0] if sizes else 12 # Default size if no text
+                dominant_flags = Counter(flags).most_common(1)[0][0] if flags else 0 # Default flags
+
+                style_str = f"font-size: {round(dominant_size)}px;"
+                if dominant_flags & 2**4: # Check for bold flag (FLAG_BOLD)
+                    style_str += " font-weight: bold;"
+                if dominant_flags & 2**1: # Check for italic flag (FLAG_ITALIC)
+                    style_str += " font-style: italic;"
+
+                for item in group["items"]:
+                    if item["type"] == "link":
+                        text_to_translate += f' <span class="notranslate">{item["text"]}</span> '
+                    else:
+                        text_to_translate += item["text"]
+                
+                try:
+                    if tokenizer and model: # Using local Hugging Face model
+                        inputs = tokenizer(text_to_translate, return_tensors="pt", truncation=True, max_length=512)
+                        translated_tokens = model.generate(**inputs)
+                        translated_text = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+                    else: # Fallback to GoogleTranslator
+                        translated_text = model.translate(text_to_translate)
+                    
+                    if not translated_text: continue
+
+                    # Re-insert links
+                    link_items = [item for item in group["items"] if item["type"] == "link"]
+                    for i, item in enumerate(link_items):
+                        url = item["dest"]
+                        link_text = item["text"]
+                        if isinstance(url, int): # Internal link
+                            href = f"#page-{url}"
+                        else: # External link
+                            href = url if url.startswith('http') else f"http://{url}"
+                        
+                        link_tag = f'<a href="{href}">{link_text}</a>'
+                        translated_text = re.sub(f'<span class="notranslate">\s*{re.escape(link_text)}\s*</span>', link_tag, translated_text, 1)
+
+                    final_html_parts.append(f"<p style='{style_str}'>{translated_text}</p>")
+
+                except Exception as e:
+                    print(f"Warning: Could not translate paragraph on page {page_num + 1}. Error: {e}", file=sys.stderr)
+                    final_html_parts.append(f'<p style="color:red;"><strong>[Translation Failed]</strong></p>')
+
+        # Add a page anchor and footer
+        page_anchor = f'<div id="page-{page_num}"></div>'
         page_footer = f'<div><hr><p style="text-align:center; color: #888;">--- Page {page_num + 1} ---</p></div>'
-        translated_html_parts.append(page_footer)
+        final_html_parts.insert(0, page_anchor)
+        final_html_parts.append(page_footer)
 
         doc.close()
-        return "\n".join(translated_html_parts)
+        return "\n".join(final_html_parts)
 
     except Exception as e:
         error_message = f"Error processing page {page_num + 1}: {e}"
@@ -93,17 +167,15 @@ def translate_page_content(page_num, pdf_path, source_lang, target_lang):
         return f'<p style="color:red;"><strong>{error_message}</strong></p>'
 
 def main():
-    """
-    Main function to orchestrate the PDF translation process.
-    """
     parser = argparse.ArgumentParser(
-        description="Translate a PDF from a source language to a target language, including images.",
+        description="Translate a PDF from a source language to a target language, including images and links.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("input_pdf", help="Path to the input PDF file.")
     parser.add_argument("output_html", help="Path for the output HTML file.")
-    parser.add_argument("-s", "--source", default='en', help="Source language code (e.g., 'en' for English). Default is 'en'.")
-    parser.add_argument("-t", "--target", default='it', help="Target language code (e.g., 'it' for Italian). Default is 'it'.")
+    parser.add_argument("-s", "--source", default='en', help="Source language code. Default: 'en'.")
+    parser.add_argument("-t", "--target", default='it', help="Target language code. Default: 'it'.")
+    parser.add_argument("--use-local-model", action="store_true", help="Use a local MarianMT model for translation. Falls back to GoogleTranslator if local model fails to load.")
     args = parser.parse_args()
 
     if not os.path.exists(args.input_pdf):
@@ -120,13 +192,39 @@ def main():
         print(f"Error: Could not open or read PDF file. Reason: {e}", file=sys.stderr)
         sys.exit(1)
 
+    tokenizer = None
+    model = None
+
+    if args.use_local_model:
+        # Load the MarianMT model and tokenizer once
+        # Determine the model name based on source and target languages
+        # For simplicity, we'll use a hardcoded 'en-it' model.
+        # In a real-world scenario, you'd want to dynamically select the model
+        # or handle cases where a specific language pair model isn't available.
+        model_name = f"Helsinki-NLP/opus-mt-{args.source}-{args.target}"
+        try:
+            tokenizer = MarianTokenizer.from_pretrained(model_name)
+            model = MarianMTModel.from_pretrained(model_name)
+            print(f"Loaded local translation model: {model_name}")
+        except Exception as e:
+            print(f"Error loading local model {model_name}: {e}", file=sys.stderr)
+            print("Falling back to GoogleTranslator.", file=sys.stderr)
+            # Fallback to GoogleTranslator if local model fails to load
+            # from deep_translator import GoogleTranslator # Already imported at top
+            model = GoogleTranslator(source=args.source, target=args.target)
+    else:
+        print("Using GoogleTranslator for translation.", file=sys.stderr)
+        # from deep_translator import GoogleTranslator # Already imported at top
+        model = GoogleTranslator(source=args.source, target=args.target)
+
+
     print(f"Source: {args.source}, Target: {args.target}")
-    print(f"Starting translation of '{args.input_pdf}' ({num_pages} pages), including images...")
+    print(f"Starting translation of '{args.input_pdf}' ({num_pages} pages), with full link and paragraph handling...")
 
     translated_pages = [""] * num_pages
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_page = {executor.submit(translate_page_content, i, pdf_path, args.source, args.target): i for i in range(num_pages)}
+        future_to_page = {executor.submit(translate_page_content, i, pdf_path, args.source, args.target, tokenizer, model): i for i in range(num_pages)}
 
         for i, future in enumerate(concurrent.futures.as_completed(future_to_page)):
             page_num = future_to_page[future]
@@ -153,7 +251,7 @@ def main():
     <title>Translation of {os.path.basename(args.input_pdf)}</title>
     <style>
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-family: Georgia, serif;
             line-height: 1.6;
             max-width: 800px;
             margin: 20px auto;
@@ -163,7 +261,7 @@ def main():
         }}
         p {{
             text-align: justify;
-            margin: 0 0 1em 0;
+            margin: 1em 0;
         }}
         h1 {{
             color: #343a40;
@@ -174,6 +272,8 @@ def main():
             background: #dee2e6;
             margin: 2em 0;
         }}
+        a {{ color: #0056b3; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
     </style>
 </head>
 <body>
