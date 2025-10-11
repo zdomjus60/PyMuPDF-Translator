@@ -55,3 +55,11 @@ python3 translate_pdf.py <input_pdf> <output_html> [-s <source_lang>] [-t <targe
   ```bash
   python3 translate_pdf.py report.pdf report_fr.html --source es --target fr
   ```
+
+### Example with Included File
+
+This repository includes the French text of "Le Petit Prince" (`st_exupery_le_petit_prince.pdf`), which is in the public domain in most countries. You can use it to test the translation from French to Italian:
+
+```bash
+python3 translate_pdf.py st_exupery_le_petit_prince.pdf le_petit_prince_it.html --source fr --target it
+```
