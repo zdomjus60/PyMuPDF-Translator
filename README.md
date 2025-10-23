@@ -28,8 +28,6 @@ This Python script translates PDF documents from a source language to a target l
 4. Install the required packages:
    ```bash
    pip install -r requirements.txt
-   # If you plan to use local models, also install:
-   pip install transformers torch sentencepiece sacremoses
    ```
 
 ## Usage
@@ -37,7 +35,7 @@ This Python script translates PDF documents from a source language to a target l
 Run the script from your terminal using the following command structure:
 
 ```bash
-python3 translate_pdf.py <input_pdf> <output_html> [-s <source_lang>] [-t <target_lang>] [--use-local-model]
+python3 translate_pdf.py <input_pdf> <output_html> [-s <source_lang>] [-t <target_lang>] [--translator <google|local>]
 ```
 
 ### Arguments
@@ -46,7 +44,7 @@ python3 translate_pdf.py <input_pdf> <output_html> [-s <source_lang>] [-t <targe
 - `<output_html>`: (Required) The path for the generated HTML output file.
 - `-s, --source`: (Optional) The source language code. Defaults to `'en'` (English).
 - `-t, --target`: (Optional) The target language code. Defaults to `'it'` (Italian).
-- `--use-local-model`: (Optional) Use a local MarianMT model for translation. If the local model fails to load or is not found for the specified language pair, it will fall back to Google Translator.
+- `--translator`: (Optional) Specifies the translation service to use. Options are `google` (for Google Translate API) or `local` (for a local Hugging Face MarianMT model). Defaults to `google`.
 
 ### Examples
 
@@ -60,14 +58,14 @@ python3 translate_pdf.py <input_pdf> <output_html> [-s <source_lang>] [-t <targe
   python3 translate_pdf.py report.pdf report_fr.html --source es --target fr
   ```
 
-- **English to Italian (attempting to use local model):**
+- **English to Italian (using local model):**
   ```bash
-  python3 translate_pdf.py my_document.pdf translated_document.html --use-local-model
+  python3 translate_pdf.py my_document.pdf translated_document.html --translator local
   ```
 
-- **French to Italian (attempting to use local model):**
+- **French to Italian (using local model):**
   ```bash
-  python3 translate_pdf.py st_exupery_le_petit_prince.pdf le_petit_prince_it.html --source fr --target it --use-local-model
+  python3 translate_pdf.py st_exupery_le_petit_prince.pdf le_petit_prince_it.html --source fr --target it --translator local
   ```
 
 ### Example with Included File
@@ -75,5 +73,5 @@ python3 translate_pdf.py <input_pdf> <output_html> [-s <source_lang>] [-t <targe
 This repository includes the French text of "Le Petit Prince" (`st_exupery_le_petit_prince.pdf`), which is in the public domain in most countries. You can use it to test the translation from French to Italian:
 
 ```bash
-python3 translate_pdf.py st_exupery_le_petit_prince.pdf le_petit_prince_it.html --source fr --target it --use-local-model
+python3 translate_pdf.py st_exupery_le_petit_prince.pdf le_petit_prince_it.html --source fr --target it --translator local
 ```
