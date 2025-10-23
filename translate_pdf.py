@@ -1,6 +1,5 @@
 import fitz  # PyMuPDF
 from deep_translator import GoogleTranslator
-from transformers import MarianTokenizer, MarianMTModel
 import concurrent.futures
 import argparse
 import os
@@ -9,7 +8,20 @@ import base64
 import re
 from collections import Counter
 
-def translate_page_content(page_num, pdf_path, source_lang, target_lang, tokenizer, model):
+# Import from our new module
+from local_translation import initialize_model, translate_local
+
+def translate_google(text, source_lang, target_lang):
+    """Wrapper for Google Translator to have a consistent function signature."""
+    if not text.strip():
+        return ""
+    try:
+        return GoogleTranslator(source=source_lang, target=target_lang).translate(text)
+    except Exception as e:
+        print(f"Errore durante la traduzione con GoogleTranslator: {e}", file=sys.stderr)
+        return f"Errore di traduzione (Google): {text}"
+
+def translate_page_content(page_num, pdf_path, translate_func, source_lang, target_lang):
     """
     Handles text, links (internal & external), and images for a single PDF page.
     This version identifies link text, protects it from translation, and recreates
@@ -124,12 +136,8 @@ def translate_page_content(page_num, pdf_path, source_lang, target_lang, tokeniz
                         text_to_translate += item["text"]
                 
                 try:
-                    if tokenizer and model: # Using local Hugging Face model
-                        inputs = tokenizer(text_to_translate, return_tensors="pt", truncation=True, max_length=512)
-                        translated_tokens = model.generate(**inputs)
-                        translated_text = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
-                    else: # Fallback to GoogleTranslator
-                        translated_text = model.translate(text_to_translate)
+                    # Simplified, consistent translation call
+                    translated_text = translate_func(text_to_translate, source_lang, target_lang)
                     
                     if not translated_text: continue
 
@@ -175,7 +183,7 @@ def main():
     parser.add_argument("output_html", help="Path for the output HTML file.")
     parser.add_argument("-s", "--source", default='en', help="Source language code. Default: 'en'.")
     parser.add_argument("-t", "--target", default='it', help="Target language code. Default: 'it'.")
-    parser.add_argument("--use-local-model", action="store_true", help="Use a local MarianMT model for translation. Falls back to GoogleTranslator if local model fails to load.")
+    parser.add_argument("--translator", default='google', choices=['google', 'local'], help="Translator to use. 'google' for Google Translate API, 'local' for local Hugging Face model. Default: 'google'.")
     args = parser.parse_args()
 
     if not os.path.exists(args.input_pdf):
@@ -192,30 +200,16 @@ def main():
         print(f"Error: Could not open or read PDF file. Reason: {e}", file=sys.stderr)
         sys.exit(1)
 
-    tokenizer = None
-    model = None
-
-    if args.use_local_model:
-        # Load the MarianMT model and tokenizer once
-        # Determine the model name based on source and target languages
-        # For simplicity, we'll use a hardcoded 'en-it' model.
-        # In a real-world scenario, you'd want to dynamically select the model
-        # or handle cases where a specific language pair model isn't available.
+    # Translator selection
+    translate_func = None
+    if args.translator == 'local':
+        print("Using local Hugging Face model for translation.")
         model_name = f"Helsinki-NLP/opus-mt-{args.source}-{args.target}"
-        try:
-            tokenizer = MarianTokenizer.from_pretrained(model_name)
-            model = MarianMTModel.from_pretrained(model_name)
-            print(f"Loaded local translation model: {model_name}")
-        except Exception as e:
-            print(f"Error loading local model {model_name}: {e}", file=sys.stderr)
-            print("Falling back to GoogleTranslator.", file=sys.stderr)
-            # Fallback to GoogleTranslator if local model fails to load
-            # from deep_translator import GoogleTranslator # Already imported at top
-            model = GoogleTranslator(source=args.source, target=args.target)
-    else:
+        initialize_model(model_name)
+        translate_func = translate_local
+    else: # 'google'
         print("Using GoogleTranslator for translation.", file=sys.stderr)
-        # from deep_translator import GoogleTranslator # Already imported at top
-        model = GoogleTranslator(source=args.source, target=args.target)
+        translate_func = translate_google
 
 
     print(f"Source: {args.source}, Target: {args.target}")
@@ -224,7 +218,7 @@ def main():
     translated_pages = [""] * num_pages
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_page = {executor.submit(translate_page_content, i, pdf_path, args.source, args.target, tokenizer, model): i for i in range(num_pages)}
+        future_to_page = {executor.submit(translate_page_content, i, pdf_path, translate_func, args.source, args.target): i for i in range(num_pages)}
 
         for i, future in enumerate(concurrent.futures.as_completed(future_to_page)):
             page_num = future_to_page[future]
